@@ -34,7 +34,7 @@ go build -o tqq main.go
 
 # 运行
 ./tqq
-
+```
 ## 🚀 快速开始
 
 如果你不是开发者，可以从 release 下载二进制包安装，或者直接用 `go install` 安装:
