@@ -80,14 +80,15 @@ type AppModel struct {
 
 // 探测当前终端是否可能支持图片协议
 func isTermImageSupported() bool {
-	term := os.Getenv("TERM")
-	termProg := os.Getenv("TERM_PROGRAM")
-	return strings.Contains(term, "kitty") ||
-		strings.Contains(term, "wezterm") ||
-		strings.Contains(term, "sixel") ||
-		strings.Contains(term, "mlterm") ||
-		term == "foot" || term == "xterm-ghostty" ||
-		termProg == "WezTerm" || termProg == "iTerm.app" || termProg == "MacTerm"
+    term := os.Getenv("TERM")
+    termProg := os.Getenv("TERM_PROGRAM")
+    return strings.Contains(term, "kitty") ||
+        strings.Contains(term, "wezterm") ||
+        strings.Contains(term, "sixel") ||
+        strings.Contains(term, "mlterm") ||
+        strings.Contains(term, "st") || // ✅ 加入对 st 的支持
+        term == "foot" || term == "xterm-ghostty" ||
+        termProg == "WezTerm" || termProg == "iTerm.app" || termProg == "MacTerm"
 }
 
 func NewApp(client *napcat.Client, selfID int64) AppModel {
@@ -377,12 +378,22 @@ func (m *AppModel) previewSelectedImage() tea.Cmd {
 			isImg := false
 
 			// Sixel などのターミナル画像プロトコルを優先
-			if isTermImageSupported() {
-				out, err = exec.Command("chafa", "--format", "sixels", "--size", sizeStr, targetPath).Output()
-				if err == nil && len(out) > 0 {
-					isImg = true
-				}
-			}
+if isTermImageSupported() {
+    // ✅ 动态选择格式
+    format := "sixels"
+    term := os.Getenv("TERM")
+    termProg := os.Getenv("TERM_PROGRAM")
+    
+    // 如果是 kitty 或者明确支持 kitty 协议的终端 (比如 wezterm)
+    if strings.Contains(term, "kitty") || termProg == "WezTerm" {
+        format = "kitty"
+    }
+
+    out, err = exec.Command("chafa", "--format", format, "--size", sizeStr, targetPath).Output()
+    if err == nil && len(out) > 0 {
+        isImg = true
+    }
+}
 
 			if !isImg {
 				out, _ = exec.Command("chafa", "--format", "symbols", "--symbols", "half", "--size", sizeStr, targetPath).Output()
