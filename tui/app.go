@@ -219,16 +219,32 @@ func (m AppModel) updateSidebar(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m AppModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.showPreview {
 		switch msg.String() {
-		case "q", "esc", "enter":
+		case "q", "esc", "enter": // 退出预览时触发一次清屏，清除图片残影
 			m.showPreview = false
 			m.previewOutput = ""
 			m.previewIsImg = false
-			return m, nil
+			return m, tea.ClearScreen
 		case "ctrl+c":
 			return m, tea.Quit
+		case "j", "down":
+			if m.current < len(m.convs) {
+				msgs := m.convs[m.current].Messages
+				if m.selectedMsg < len(msgs)-1 {
+					m.selectedMsg++
+					return m, m.previewSelectedImage() // 触发新消息预览
+				}
+			}
+			return m, nil
+		case "k", "up":
+			if m.selectedMsg > 0 {
+				m.selectedMsg--
+				return m, m.previewSelectedImage() // 触发新消息预览
+			}
+			return m, nil
 		}
 		return m, nil
 	}
+
 	if m.inputMode {
 		switch msg.String() {
 		case "esc":
@@ -291,118 +307,123 @@ func (m *AppModel) previewSelectedImage() tea.Cmd {
 	}
 	evt := msgs[m.selectedMsg]
 
-	for _, seg := range evt.Message {
-		if seg.Type != "image" {
-			continue
-		}
-		var d napcat.ImageData
-		json.Unmarshal(seg.Data, &d)
-		url := napcat.GetImageURL(d.File, d.URL)
-		if url == "" {
-			return nil
-		}
-
-		m.showPreview = true
-		m.previewOutput = "图片加载中...\n\n(按 'q' 返回)"
-		m.previewIsImg = false
-
-		return func() tea.Msg {
-			var targetPath string
-
-			if strings.HasPrefix(url, "local://") {
-				targetPath = strings.TrimPrefix(url, "local://")
-			} else {
-				cacheDir := "/tmp/tqq_cache"
-				os.MkdirAll(cacheDir, 0755)
-				fileName := d.File
-				if fileName == "" {
-					fileName = "temp.jpg"
-				}
-				fileName = strings.ReplaceAll(fileName, "/", "_")
-				fileName = strings.ReplaceAll(fileName, "\\", "_")
-				targetPath = filepath.Join(cacheDir, fileName+".jpg")
-
-				if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-					if err := exec.Command("curl", "-s", "-L", "-o", targetPath, url).Run(); err != nil {
-						return previewResultMsg{"图片下载失败", false, 0, 0}
-					}
-				}
-			}
-
-			sidebarOuterW := 0
-			if m.showSidebar {
-				sidebarOuterW = m.width / 4
-			}
-			remainingOuter := m.width - sidebarOuterW
-			chatOuterW := remainingOuter * 2 / 3
-			previewOuterW := remainingOuter - chatOuterW
-			
-			previewInnerW := previewOuterW - 2
-
-			// 最大許可サイズ（安全マージンを含む）
-			w := previewInnerW - 6
-			h := m.height - 12
-			if w <= 10 { w = 10 }
-			if h <= 5 { h = 5 }
-
-			// 【新ロジック】実際の画像サイズを読み取り、ターミナル上での「真の幅と高さ」を計算
-			actualW := w
-			actualH := h
-			if file, err := os.Open(targetPath); err == nil {
-				if imgConfig, _, err := image.DecodeConfig(file); err == nil {
-					imgW := float64(imgConfig.Width)
-					imgH := float64(imgConfig.Height)
-					if imgW > 0 && imgH > 0 {
-						// ターミナルセルの一般的なアスペクト比は 1:2 （幅:高さ）
-						spaceRatio := float64(w) / float64(h*2)
-						imgRatio := imgW / imgH
-						if imgRatio < spaceRatio {
-							// 縦長の画像の場合：高さがボトルネックになる
-							actualW = int(imgRatio * float64(h*2))
-							actualH = h
-						} else {
-							// 横長の画像の場合：幅がボトルネックになる
-							actualW = w
-							actualH = int(float64(w) / (imgRatio * 2))
-						}
-					}
-				}
-				file.Close()
-			}
-			if actualW < 1 { actualW = 1 }
-			if actualH < 1 { actualH = 1 }
-
-			sizeStr := fmt.Sprintf("%dx%d", w, h)            
-			var out []byte
-			var err error
-			isImg := false
-
-			// Sixel などのターミナル画像プロトコルを優先
-if isTermImageSupported() {
-    // ✅ 动态选择格式
-    format := "sixels"
-    term := os.Getenv("TERM")
-    termProg := os.Getenv("TERM_PROGRAM")
-    
-    // 如果是 kitty 或者明确支持 kitty 协议的终端 (比如 wezterm)
-    if strings.Contains(term, "kitty") || termProg == "WezTerm" {
-        format = "kitty"
-    }
-
-    out, err = exec.Command("chafa", "--format", format, "--size", sizeStr, targetPath).Output()
-    if err == nil && len(out) > 0 {
-        isImg = true
-    }
-}
-
-			if !isImg {
-				out, _ = exec.Command("chafa", "--format", "symbols", "--symbols", "half", "--size", sizeStr, targetPath).Output()
-			}
-
-			return previewResultMsg{string(out), isImg, actualW, actualH}
+	var imgSeg *napcat.Segment
+	for i := range evt.Message {
+		if evt.Message[i].Type == "image" {
+			imgSeg = &evt.Message[i]
+			break
 		}
 	}
-	return nil
+
+	// 如果滚动到的消息没有图片，提示并清屏擦除老图片
+	if imgSeg == nil {
+		m.showPreview = true
+		m.previewOutput = "当前消息无图片\n\n(jk切换，q退出)"
+		m.previewIsImg = false
+		return tea.ClearScreen
+	}
+
+	var d napcat.ImageData
+	json.Unmarshal(imgSeg.Data, &d)
+	url := napcat.GetImageURL(d.File, d.URL)
+	if url == "" {
+		m.showPreview = true
+		m.previewOutput = "图片链接无效\n\n(jk切换，q退出)"
+		m.previewIsImg = false
+		return tea.ClearScreen
+	}
+
+	m.showPreview = true
+	m.previewOutput = "图片加载中...\n\n(jk切换，q退出)"
+	m.previewIsImg = false
+
+	return func() tea.Msg {
+		var targetPath string
+
+		if strings.HasPrefix(url, "local://") {
+			targetPath = strings.TrimPrefix(url, "local://")
+		} else {
+			cacheDir := "/tmp/tqq_cache"
+			os.MkdirAll(cacheDir, 0755)
+			fileName := d.File
+			if fileName == "" {
+				fileName = "temp.jpg"
+			}
+			fileName = strings.ReplaceAll(fileName, "/", "_")
+			fileName = strings.ReplaceAll(fileName, "\\", "_")
+			targetPath = filepath.Join(cacheDir, fileName+".jpg")
+
+			if _, err := os.Stat(targetPath); os.IsNotExist(err) {
+				if err := exec.Command("curl", "-s", "-L", "-o", targetPath, url).Run(); err != nil {
+					return previewResultMsg{"图片下载失败", false, 0, 0}
+				}
+			}
+		}
+
+		sidebarOuterW := 0
+		if m.showSidebar {
+			sidebarOuterW = m.width / 4
+		}
+		remainingOuter := m.width - sidebarOuterW
+		chatOuterW := remainingOuter * 2 / 3
+		previewOuterW := remainingOuter - chatOuterW
+		
+		previewInnerW := previewOuterW - 2
+
+		w := previewInnerW - 6
+		h := m.height - 12
+		if w <= 10 { w = 10 }
+		if h <= 5 { h = 5 }
+
+		actualW := w
+		actualH := h
+		if file, err := os.Open(targetPath); err == nil {
+			if imgConfig, _, err := image.DecodeConfig(file); err == nil {
+				imgW := float64(imgConfig.Width)
+				imgH := float64(imgConfig.Height)
+				if imgW > 0 && imgH > 0 {
+					spaceRatio := float64(w) / float64(h*2)
+					imgRatio := imgW / imgH
+					if imgRatio < spaceRatio {
+						actualW = int(imgRatio * float64(h*2))
+						actualH = h
+					} else {
+						actualW = w
+						actualH = int(float64(w) / (imgRatio * 2))
+					}
+				}
+			}
+			file.Close()
+		}
+		if actualW < 1 { actualW = 1 }
+		if actualH < 1 { actualH = 1 }
+
+		sizeStr := fmt.Sprintf("%dx%d", w, h)            
+		var out []byte
+		var err error
+		isImg := false
+
+		if isTermImageSupported() {
+			format := "sixels"
+			term := os.Getenv("TERM")
+			termProg := os.Getenv("TERM_PROGRAM")
+			
+			if strings.Contains(term, "kitty") || termProg == "WezTerm" {
+				format = "kitty"
+			}
+
+			out, err = exec.Command("chafa", "--format", format, "--size", sizeStr, targetPath).Output()
+			if err == nil && len(out) > 0 {
+				isImg = true
+			}
+		}
+
+		if !isImg {
+			out, _ = exec.Command("chafa", "--format", "symbols", "--symbols", "half", "--size", sizeStr, targetPath).Output()
+		}
+
+		return previewResultMsg{string(out), isImg, actualW, actualH}
+	}
 }
 
 func (m AppModel) sendClipboardImage() tea.Cmd {
@@ -555,8 +576,7 @@ func (m AppModel) View() string {
 
 	ui := lipgloss.JoinVertical(lipgloss.Left, top, input)
 
-	// 【完全な中央配置】実際の画像サイズを用いて、上下左右のオフセットを計算
-	if m.showPreview && m.previewIsImg {
+if m.showPreview && m.previewIsImg {
 		actualW := m.previewImgWidth
 		actualH := m.previewImgHeight
 		if actualW <= 0 { actualW = previewInnerW - 6 }
@@ -577,13 +597,23 @@ func (m AppModel) View() string {
 		safeImgOutput = strings.ReplaceAll(safeImgOutput, "\n", "")
 		safeImgOutput = strings.ReplaceAll(safeImgOutput, "\r", "")
 
-		overlay := fmt.Sprintf("\x1b7\x1b[?7l\x1b[?80l\x1b[%d;%dH%s\x1b[?80h\x1b[?7h\x1b8", row, col, safeImgOutput)
+		// 【关键修复】构造清理序列：利用终端 ANSI 移动光标并填充空格，把预览框内部空间物理擦除一次
+		clearSeq := ""
+		startRow := 2
+		startCol := sidebarOuterW + chatOuterW + 2
+		for r := 0; r < innerH; r++ {
+			clearSeq += fmt.Sprintf("\x1b[%d;%dH%s", startRow+r, startCol, strings.Repeat(" ", previewInnerW))
+		}
+		
+		kittyClear := "\x1b_a=d\x1b\\" // Kitty 协议全清指令（非Kitty终端会忽略）
+
+		// 先清屏 (kittyClear + clearSeq)，再将光标移到正确位置画图
+		overlay := fmt.Sprintf("\x1b7%s%s\x1b[?7l\x1b[?80l\x1b[%d;%dH%s\x1b[?80h\x1b[?7h\x1b8", kittyClear, clearSeq, row, col, safeImgOutput)
 		ui += overlay
 	}
 
 	return ui
 }
-
 func (m AppModel) renderSidebar(w, h int) string {
 	content := ""
 	for i, conv := range m.convs {
