@@ -34,7 +34,7 @@ func (c *Client) readLoop() {
 			return
 		}
 		var evt Event
-		if json.Unmarshal(msg, &evt) == nil && evt.PostType == "message" {
+		if json.Unmarshal(msg, &evt) == nil && (evt.PostType == "message" || evt.PostType == "message_sent") {
 			c.Events <- evt
 		}
 	}
