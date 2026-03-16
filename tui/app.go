@@ -3,6 +3,10 @@ package tui
 import (
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,25 +53,41 @@ type Conversation struct {
 type newMessageMsg napcat.Event
 
 type previewResultMsg struct {
-	content string
-	isImg   bool
+	content   string
+	isImg     bool
+	imgWidth  int
+	imgHeight int
 }
 
 type AppModel struct {
-	client        *napcat.Client
-	selfID        int64
-	convs         []Conversation
-	current       int
-	input         string
-	focus         string
-	inputMode     bool
-	selectedMsg   int
-	width         int
-	height        int
-	showPreview   bool
-	previewOutput string
-	showSidebar   bool
-	previewIsImg  bool
+	client           *napcat.Client
+	selfID           int64
+	convs            []Conversation
+	current          int
+	input            string
+	focus            string
+	inputMode        bool
+	selectedMsg      int
+	width            int
+	height           int
+	showPreview      bool
+	previewOutput    string
+	showSidebar      bool
+	previewIsImg     bool
+	previewImgWidth  int
+	previewImgHeight int
+}
+
+// 探测当前终端是否可能支持图片协议
+func isTermImageSupported() bool {
+	term := os.Getenv("TERM")
+	termProg := os.Getenv("TERM_PROGRAM")
+	return strings.Contains(term, "kitty") ||
+		strings.Contains(term, "wezterm") ||
+		strings.Contains(term, "sixel") ||
+		strings.Contains(term, "mlterm") ||
+		term == "foot" || term == "xterm-ghostty" ||
+		termProg == "WezTerm" || termProg == "iTerm.app" || termProg == "MacTerm"
 }
 
 func NewApp(client *napcat.Client, selfID int64) AppModel {
@@ -112,6 +132,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showPreview {
 			m.previewOutput = msg.content
 			m.previewIsImg = msg.isImg
+			m.previewImgWidth = msg.imgWidth
+			m.previewImgHeight = msg.imgHeight
 		}
 		return m, nil
 	case imageSentMsg:
@@ -301,33 +323,72 @@ func (m *AppModel) previewSelectedImage() tea.Cmd {
 
 				if _, err := os.Stat(targetPath); os.IsNotExist(err) {
 					if err := exec.Command("curl", "-s", "-L", "-o", targetPath, url).Run(); err != nil {
-						return previewResultMsg{"图片下载失败", false}
+						return previewResultMsg{"图片下载失败", false, 0, 0}
 					}
 				}
 			}
 
-			sidebarW := 0
+			sidebarOuterW := 0
 			if m.showSidebar {
-				sidebarW = m.width / 4
+				sidebarOuterW = m.width / 4
 			}
-			chatW := (m.width - sidebarW) / 2 - 2
-			previewW := m.width - sidebarW - chatW - 4
+			remainingOuter := m.width - sidebarOuterW
+			chatOuterW := remainingOuter * 2 / 3
+			previewOuterW := remainingOuter - chatOuterW
+			
+			previewInnerW := previewOuterW - 2
 
-			w, h := previewW-4, m.height-7
-			if w <= 0 {
-				w = 10
-			}
-			if h <= 0 {
-				h = 10
-			}
-			sizeStr := fmt.Sprintf("%dx%d", w, h)
+			// 最大許可サイズ（安全マージンを含む）
+			w := previewInnerW - 6
+			h := m.height - 12
+			if w <= 10 { w = 10 }
+			if h <= 5 { h = 5 }
 
-			out, err := exec.Command("chafa", "--format", "sixels", "--size", sizeStr, targetPath).Output()
-			if err == nil && len(out) > 0 {
-				return previewResultMsg{string(out), true}
+			// 【新ロジック】実際の画像サイズを読み取り、ターミナル上での「真の幅と高さ」を計算
+			actualW := w
+			actualH := h
+			if file, err := os.Open(targetPath); err == nil {
+				if imgConfig, _, err := image.DecodeConfig(file); err == nil {
+					imgW := float64(imgConfig.Width)
+					imgH := float64(imgConfig.Height)
+					if imgW > 0 && imgH > 0 {
+						// ターミナルセルの一般的なアスペクト比は 1:2 （幅:高さ）
+						spaceRatio := float64(w) / float64(h*2)
+						imgRatio := imgW / imgH
+						if imgRatio < spaceRatio {
+							// 縦長の画像の場合：高さがボトルネックになる
+							actualW = int(imgRatio * float64(h*2))
+							actualH = h
+						} else {
+							// 横長の画像の場合：幅がボトルネックになる
+							actualW = w
+							actualH = int(float64(w) / (imgRatio * 2))
+						}
+					}
+				}
+				file.Close()
 			}
-			out, _ = exec.Command("chafa", "--format", "symbols", "--size", sizeStr, targetPath).Output()
-			return previewResultMsg{string(out), false}
+			if actualW < 1 { actualW = 1 }
+			if actualH < 1 { actualH = 1 }
+
+			sizeStr := fmt.Sprintf("%dx%d", w, h)            
+			var out []byte
+			var err error
+			isImg := false
+
+			// Sixel などのターミナル画像プロトコルを優先
+			if isTermImageSupported() {
+				out, err = exec.Command("chafa", "--format", "sixels", "--size", sizeStr, targetPath).Output()
+				if err == nil && len(out) > 0 {
+					isImg = true
+				}
+			}
+
+			if !isImg {
+				out, _ = exec.Command("chafa", "--format", "symbols", "--symbols", "half", "--size", sizeStr, targetPath).Output()
+			}
+
+			return previewResultMsg{string(out), isImg, actualW, actualH}
 		}
 	}
 	return nil
@@ -434,25 +495,34 @@ func (m AppModel) View() string {
 		return "Loading..."
 	}
 
-	sidebarW := 0
+	sidebarOuterW := 0
 	if m.showSidebar {
-		sidebarW = m.width / 4
+		sidebarOuterW = m.width / 4
 	}
 
-	chatW := m.width - sidebarW - 4
-	previewW := 0
+	var chatOuterW, previewOuterW int
 	if m.showPreview {
-		chatW = (m.width - sidebarW) / 2 - 2
-		previewW = m.width - sidebarW - chatW - 4
+		remainingOuter := m.width - sidebarOuterW
+		chatOuterW = remainingOuter * 2 / 3 
+		previewOuterW = remainingOuter - chatOuterW
+	} else {
+		chatOuterW = m.width - sidebarOuterW
 	}
+
+	sidebarInnerW := sidebarOuterW - 2
+	if sidebarInnerW < 1 { sidebarInnerW = 1 }
+	chatInnerW := chatOuterW - 2
+	if chatInnerW < 1 { chatInnerW = 1 }
+	previewInnerW := previewOuterW - 2
+	if previewInnerW < 1 { previewInnerW = 1 }
 
 	innerH := m.height - 5
 	var layout []string
 
 	if m.showSidebar {
-		layout = append(layout, m.renderSidebar(sidebarW, innerH))
+		layout = append(layout, m.renderSidebar(sidebarInnerW, innerH))
 	}
-	layout = append(layout, m.renderChat(chatW, innerH))
+	layout = append(layout, m.renderChat(chatInnerW, innerH))
 
 	if m.showPreview {
 		content := ""
@@ -463,7 +533,7 @@ func (m AppModel) View() string {
 		previewStyle := lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("62")).
-			Width(previewW).Height(innerH).
+			Width(previewInnerW).Height(innerH).
 			Align(lipgloss.Center)
 
 		layout = append(layout, previewStyle.Render(content))
@@ -474,13 +544,29 @@ func (m AppModel) View() string {
 
 	ui := lipgloss.JoinVertical(lipgloss.Left, top, input)
 
+	// 【完全な中央配置】実際の画像サイズを用いて、上下左右のオフセットを計算
 	if m.showPreview && m.previewIsImg {
-		row := 3
-		col := chatW + 4
-		if m.showSidebar {
-			col += sidebarW
-		}
-		overlay := fmt.Sprintf("\x1b7\x1b[%d;%dH%s\x1b8", row, col, m.previewOutput)
+		actualW := m.previewImgWidth
+		actualH := m.previewImgHeight
+		if actualW <= 0 { actualW = previewInnerW - 6 }
+		if actualH <= 0 { actualH = innerH - 7 }
+
+		// 水平・垂直のセンタリングオフセットを計算
+		colOffset := (previewInnerW - actualW) / 2
+		if colOffset < 0 { colOffset = 0 }
+		rowOffset := (innerH - actualH) / 2
+		if rowOffset < 0 { rowOffset = 0 }
+
+		// 行: 内枠の起点(2) + 垂直オフセット
+		row := 2 + rowOffset 
+		// 列: サイドバー幅 + チャット枠幅 + 内枠起点(2) + 水平オフセット
+		col := sidebarOuterW + chatOuterW + 2 + colOffset 
+
+		safeImgOutput := strings.TrimSpace(m.previewOutput)
+		safeImgOutput = strings.ReplaceAll(safeImgOutput, "\n", "")
+		safeImgOutput = strings.ReplaceAll(safeImgOutput, "\r", "")
+
+		overlay := fmt.Sprintf("\x1b7\x1b[?7l\x1b[?80l\x1b[%d;%dH%s\x1b[?80h\x1b[?7h\x1b8", row, col, safeImgOutput)
 		ui += overlay
 	}
 
@@ -524,7 +610,8 @@ func (m AppModel) renderChat(w, h int) string {
 	}
 
 	conv := m.convs[m.current]
-	innerW := w - 4
+	wrapStyle := lipgloss.NewStyle().Width(w)
+
 	var allLines []string
 	selectedStart := 0
 	selectedEnd := 0
@@ -541,7 +628,6 @@ func (m AppModel) renderChat(w, h int) string {
 		if evt.UserID == m.selfID {
 			style := lipgloss.NewStyle().
 				Foreground(lipgloss.Color("42")).
-				Width(innerW).
 				Align(lipgloss.Right)
 			if isSelected {
 				style = style.Background(lipgloss.Color("22"))
@@ -558,13 +644,13 @@ func (m AppModel) renderChat(w, h int) string {
 			line = nameStr + msgStyle.Render(rendered)
 		}
 
-		visualLines := strings.Split(strings.TrimRight(line, "\n"), "\n")
+		wrappedLine := wrapStyle.Render(line)
+		visualLines := strings.Split(strings.TrimRight(wrappedLine, "\n"), "\n")
 
 		if isSelected {
 			selectedStart = len(allLines)
 			selectedEnd = len(allLines) + len(visualLines) - 1
 		}
-
 		allLines = append(allLines, visualLines...)
 	}
 
