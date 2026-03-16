@@ -35,7 +35,6 @@ type imageSentMsg struct {
 	filePath  string
 }
 
-
 type Conversation struct {
 	ID       int64
 	Name     string
@@ -47,30 +46,45 @@ type Conversation struct {
 type newMessageMsg napcat.Event
 
 type AppModel struct {
-	client      *napcat.Client
-	selfID      int64
-	convs       []Conversation
-	current     int
-	input       string
-	focus       string
-	inputMode   bool
-	selectedMsg int
-	width       int
-	height      int
+	client        *napcat.Client
+	selfID        int64
+	convs         []Conversation
+	current       int
+	input         string
+	focus         string
+	inputMode     bool
+	selectedMsg   int
+	width         int
+	height        int
+	showPreview   bool   // 是否开启了图片预览
+	previewOutput string // 存放 chafa 渲染出来的 ASCII/Sixel 字符串
+	showSidebar   bool   // 为第3点做准备：是否显示侧边栏
+	previewIsImg bool
 }
 
 func NewApp(client *napcat.Client, selfID int64) AppModel {
 	return AppModel{
-		client: client,
-		selfID: selfID,
-		focus:  "sidebar",
+		client:      client,
+		selfID:      selfID,
+		focus:       "sidebar",
+		showSidebar: true, // 默认开启
 	}
 }
 
-func (m AppModel) Init() tea.Cmd {
-	return waitForMessage(m.client.Events)
-}
+type fetchHistoryMsg struct{}
 
+func (m AppModel) Init() tea.Cmd {
+	return tea.Batch(
+		waitForMessage(m.client.Events),
+		func() tea.Msg {
+			// 初始化时请求最近会话列表
+			m.client.CallAPI("get_recent_contact", map[string]interface{}{})
+			// 这个 API 会通过 websocket 返回结果，你需要调整 websocket 的 readLoop 
+			// 把 API的 response (带有 echo 的 JSON) 也发到 Events 或新的 Channel 中解析
+			return nil
+		},
+	)
+}
 func waitForMessage(events <-chan napcat.Event) tea.Cmd {
 	return func() tea.Msg {
 		return newMessageMsg(<-events)
@@ -86,6 +100,12 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		evt := napcat.Event(msg)
 		m.upsertMessage(evt)
 		return m, waitForMessage(m.client.Events)
+	case previewResultMsg:
+		if m.showPreview {
+			m.previewOutput = msg.content
+			m.previewIsImg = msg.isImg
+		}
+		return m, nil
 	case imageSentMsg:
 		defer os.Remove(msg.filePath)
 		if msg.convIndex < len(m.convs) {
@@ -102,6 +122,17 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		// 修复1：合并所有的 tea.KeyMsg 处理逻辑
+		// 优先处理全局快捷键 1：切换侧边栏
+		if msg.String() == "1" && !m.inputMode && !m.showPreview {
+			m.showSidebar = !m.showSidebar
+			if !m.showSidebar && m.focus == "sidebar" {
+				m.focus = "chat" // 侧边栏隐藏后，焦点强制回聊天区
+			}
+			return m, nil
+		}
+
+		// 根据当前焦点分配按键事件
 		switch m.focus {
 		case "sidebar":
 			return m.updateSidebar(msg)
@@ -131,8 +162,21 @@ func (m AppModel) updateSidebar(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
-}   // ← 只有这一个 }，删掉下面多余的那个
+}
+
 func (m AppModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.showPreview {
+		switch msg.String() {
+		case "q", "esc", "enter":
+			m.showPreview = false
+			m.previewOutput = ""
+			m.previewIsImg = false
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		}
+		return m, nil // 拦截其他按键
+	}
 	if m.inputMode {
 		switch msg.String() {
 		case "esc":
@@ -186,47 +230,60 @@ func (m AppModel) updateChat(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m AppModel) previewSelectedImage() tea.Cmd {
-	if m.current >= len(m.convs) {
-		return nil
-	}
+func (m *AppModel) previewSelectedImage() tea.Cmd {
+	if m.current >= len(m.convs) { return nil }
 	msgs := m.convs[m.current].Messages
-	if m.selectedMsg >= len(msgs) {
-		return nil
-	}
+	if m.selectedMsg >= len(msgs) { return nil }
 	evt := msgs[m.selectedMsg]
 
 	for _, seg := range evt.Message {
-		if seg.Type != "image" {
-			continue
-		}
+		if seg.Type != "image" { continue }
 		var d napcat.ImageData
 		json.Unmarshal(seg.Data, &d)
 		url := napcat.GetImageURL(d.File, d.URL)
-		if url == "" {
-			return nil
-		}
+		if url == "" { return nil }
+		
+		m.showPreview = true
+		m.previewOutput = "图片加载中...\n\n(按 'q' 返回)"
+		m.previewIsImg = false // 加载中的文字不是图片
+
 		return func() tea.Msg {
-			go func() {
-				tmp, err := os.CreateTemp("", "tqq-preview-*.jpg")
-				if err != nil {
-					return
-				}
-				tmp.Close()
-				defer os.Remove(tmp.Name())
-				if err := exec.Command("curl", "-s", "-L", "-o", tmp.Name(), url).Run(); err != nil {
-					return
-				}
-				script := fmt.Sprintf(
-					"chafa --fit-width --size 60x30 %s; echo ''; echo '按 Enter 关闭...'; read",
-					tmp.Name(),
-				)
-				exec.Command("foot", "-T", "图片预览", "--", "sh", "-c", script).Run()
-			}()
-			return nil
+			tmp, err := os.CreateTemp("", "tqq-preview-*.jpg")
+			if err != nil { return previewResultMsg{"图片下载失败", false} }
+			defer os.Remove(tmp.Name())
+			tmp.Close()
+
+			if err := exec.Command("curl", "-s", "-L", "-o", tmp.Name(), url).Run(); err != nil {
+				return previewResultMsg{"图片下载失败", false}
+			}
+
+			// 预先计算右侧面板内部的安全尺寸
+			sidebarW := 0
+			if m.showSidebar { sidebarW = m.width / 4 }
+			chatW := (m.width - sidebarW) / 2 - 2
+			previewW := m.width - sidebarW - chatW - 4
+			
+			w, h := previewW-4, m.height-7
+			if w <= 0 { w = 10 }
+			if h <= 0 { h = 10 }
+			sizeStr := fmt.Sprintf("%dx%d", w, h)
+
+			// 优先尝试 Sixel
+			out, err := exec.Command("chafa", "--format", "sixels", "--size", sizeStr, tmp.Name()).Output()
+			if err == nil && len(out) > 0 {
+				return previewResultMsg{string(out), true} // 成功生成图片
+			}
+			// 兜底：纯字符画
+			out, _ = exec.Command("chafa", "--format", "symbols", "--size", sizeStr, tmp.Name()).Output()
+			return previewResultMsg{string(out), false} // 字符画视为普通文本
 		}
 	}
 	return nil
+}
+
+type previewResultMsg struct {
+	content string
+	isImg bool
 }
 
 func (m AppModel) sendClipboardImage() tea.Cmd {
@@ -259,7 +316,6 @@ func (m AppModel) sendFileImage() tea.Cmd {
 		return imageSentMsg{convIndex: convIndex, filePath: path}
 	}
 }
-
 
 func (m *AppModel) upsertMessage(evt napcat.Event) {
 	var id int64
@@ -325,16 +381,67 @@ func (m AppModel) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
-	sidebarW := m.width / 4
+	
+	sidebarW := 0
+	if m.showSidebar {
+		sidebarW = m.width / 4
+	}
+	
 	chatW := m.width - sidebarW - 4
-	innerH := m.height - 5
+	previewW := 0
+	if m.showPreview {
+		chatW = (m.width - sidebarW) / 2 - 2
+		previewW = m.width - sidebarW - chatW - 4
+	}
 
-	sidebar := m.renderSidebar(sidebarW, innerH)
-	chat := m.renderChat(chatW, innerH)
+	innerH := m.height - 5
+	var layout []string
+
+	if m.showSidebar {
+		layout = append(layout, m.renderSidebar(sidebarW, innerH))
+	}
+	layout = append(layout, m.renderChat(chatW, innerH))
+
+	if m.showPreview {
+		content := ""
+		// 如果是文字或字符画，交给 Lipgloss 去排版
+		if !m.previewIsImg {
+			content = "\n" + m.previewOutput 
+		}
+
+		// 必须恢复固定宽高，这样才能画出一个漂亮的外框作为“底板”
+		previewStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Width(previewW).Height(innerH).
+			Align(lipgloss.Center) 
+		
+		layout = append(layout, previewStyle.Render(content))
+	}
+
+	top := lipgloss.JoinHorizontal(lipgloss.Top, layout...)
 	input := m.renderInput(m.width)
 
-	top := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, chat)
-	return lipgloss.JoinVertical(lipgloss.Left, top, input)
+	// 这是底层排版 UI
+	ui := lipgloss.JoinVertical(lipgloss.Left, top, input)
+
+	// 【魔法操作】如果存在真正的图片，使用 ANSI 绝对坐标强行画在 UI 上层
+	if m.showPreview && m.previewIsImg {
+		// 第3行：避开顶部边框 (Row 是 1-indexed)
+		row := 3 
+		// 计算光标所在的列，加上偏移量避开左侧边框
+		col := chatW + 4 
+		if m.showSidebar {
+			col += sidebarW
+		}
+		
+		// \x1b7: 保存当前光标, \x1b[%d;%dH: 移动光标到绝对位置, \x1b8: 恢复光标
+		// 这样既画了图，又不会干扰 Bubbletea 的内部状态
+		overlay := fmt.Sprintf("\x1b7\x1b[%d;%dH%s\x1b8", row, col, m.previewOutput)
+		ui += overlay
+	}
+
+	return ui
 }
 
 func (m AppModel) renderSidebar(w, h int) string {
@@ -458,4 +565,3 @@ func (m AppModel) renderInput(w int) string {
 
 	return lipgloss.JoinHorizontal(lipgloss.Center, modeTag, " ", inputArea)
 }
-
