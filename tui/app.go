@@ -127,7 +127,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case newMessageMsg:
 		evt := napcat.Event(msg)
 		m.upsertMessage(evt)
-		saveHistory(m.convs)
+		// 删除了 saveHistory，由退出时统一保存
 		return m, waitForMessage(m.client.Events)
 	case previewResultMsg:
 		if m.showPreview {
@@ -138,15 +138,8 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case imageSentMsg:
-		var targetPath string
-		if msg.isTemp {
-			cacheDir := "/tmp/tqq_cache"
-			os.MkdirAll(cacheDir, 0755)
-			targetPath = filepath.Join(cacheDir, filepath.Base(msg.filePath))
-			os.Rename(msg.filePath, targetPath)
-		} else {
-			targetPath = msg.filePath
-		}
+		// 剪贴板发的图直接复用系统临时目录中的文件，由系统自行回收，不再长期占据 tqq_cache
+		targetPath := msg.filePath
 
 		if msg.convIndex < len(m.convs) {
 			imgData := fmt.Sprintf(`{"file":"%s", "url":"local://%s"}`, filepath.Base(targetPath), targetPath)
@@ -164,7 +157,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.current == msg.convIndex {
 				m.selectedMsg = len(m.convs[m.current].Messages) - 1
 			}
-			saveHistory(m.convs)
+			// 删除了 saveHistory
 		}
 		return m, nil
 	case tea.KeyMsg:
@@ -208,7 +201,7 @@ func (m AppModel) updateSidebar(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.focus = "chat"
 		if m.current < len(m.convs) {
 			m.convs[m.current].Unread = 0
-			saveHistory(m.convs)
+			// 去除了 saveHistory(m.convs)
 		}
 	case "q", "ctrl+c":
 		return m, tea.Quit
@@ -315,7 +308,6 @@ func (m *AppModel) previewSelectedImage() tea.Cmd {
 		}
 	}
 
-	// 如果滚动到的消息没有图片，提示并清屏擦除老图片
 	if imgSeg == nil {
 		m.showPreview = true
 		m.previewOutput = "当前消息无图片\n\n(jk切换，q退出)"
@@ -339,26 +331,32 @@ func (m *AppModel) previewSelectedImage() tea.Cmd {
 
 	return func() tea.Msg {
 		var targetPath string
+		var isTempFile bool
 
 		if strings.HasPrefix(url, "local://") {
 			targetPath = strings.TrimPrefix(url, "local://")
 		} else {
-			cacheDir := "/tmp/tqq_cache"
-			os.MkdirAll(cacheDir, 0755)
-			fileName := d.File
-			if fileName == "" {
-				fileName = "temp.jpg"
+			// 直接在系统默认临时目录下创建一个临时文件
+			tmpFile, err := os.CreateTemp("", "tqq-img-*.jpg")
+			if err != nil {
+				return previewResultMsg{"创建临时文件失败", false, 0, 0}
 			}
-			fileName = strings.ReplaceAll(fileName, "/", "_")
-			fileName = strings.ReplaceAll(fileName, "\\", "_")
-			targetPath = filepath.Join(cacheDir, fileName+".jpg")
+			targetPath = tmpFile.Name()
+			tmpFile.Close() // 先关掉句柄，让 curl 去写
+			isTempFile = true
 
-			if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-				if err := exec.Command("curl", "-s", "-L", "-o", targetPath, url).Run(); err != nil {
-					return previewResultMsg{"图片下载失败", false, 0, 0}
-				}
+			if err := exec.Command("curl", "-s", "-L", "-o", targetPath, url).Run(); err != nil {
+				os.Remove(targetPath)
+				return previewResultMsg{"图片下载失败", false, 0, 0}
 			}
 		}
+
+		// ✨ 核心优化：闭包执行结束，终端渲染器拿到数据后，立刻从硬盘彻底删除这张图
+		defer func() {
+			if isTempFile {
+				os.Remove(targetPath)
+			}
+		}()
 
 		sidebarOuterW := 0
 		if m.showSidebar {
@@ -475,6 +473,15 @@ func (m *AppModel) upsertMessage(evt napcat.Event) {
 		if m.convs[i].ID == id {
 			isAtBottom := (m.selectedMsg == len(m.convs[i].Messages)-1)
 			m.convs[i].Messages = append(m.convs[i].Messages, evt)
+			
+			// 新增：在内存中也实时截断至 100 条，避免后台长期运行导致内存暴增
+			if len(m.convs[i].Messages) > 100 {
+				m.convs[i].Messages = m.convs[i].Messages[len(m.convs[i].Messages)-100:]
+				if m.selectedMsg >= 100 {
+					m.selectedMsg = 99
+				}
+			}
+
 			if i != m.current || m.focus != "chat" {
 				m.convs[i].Unread++
 			} else if isAtBottom {
@@ -491,7 +498,6 @@ func (m *AppModel) upsertMessage(evt napcat.Event) {
 		Unread:   1,
 	})
 }
-
 func (m *AppModel) sendText() {
 	conv := m.convs[m.current]
 	seg := napcat.Segment{Type: "text"}
@@ -519,7 +525,7 @@ func (m *AppModel) sendText() {
 		},
 	})
 	m.selectedMsg = len(m.convs[m.current].Messages) - 1
-	saveHistory(m.convs)
+	// 去除了 saveHistory(m.convs)
 }
 
 func (m AppModel) View() string {
@@ -780,7 +786,7 @@ func loadHistory() []Conversation {
 	return convs
 }
 
-func saveHistory(convs []Conversation) {
+func (m AppModel) SaveHistory() {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return
@@ -789,10 +795,11 @@ func saveHistory(convs []Conversation) {
 	os.MkdirAll(filepath.Dir(path), 0755)
 
 	var cache []Conversation
-	for _, c := range convs {
+	for _, c := range m.convs {
 		cc := c
-		if len(cc.Messages) > 50 {
-			cc.Messages = cc.Messages[len(cc.Messages)-50:]
+		// 修改：根据要求只保留每个会话的最后 100 条消息
+		if len(cc.Messages) > 100 {
+			cc.Messages = cc.Messages[len(cc.Messages)-100:]
 		}
 		cache = append(cache, cc)
 	}

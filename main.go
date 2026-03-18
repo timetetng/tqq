@@ -27,8 +27,15 @@ func main() {
 	app := tui.NewApp(client, cfg.NapCat.SelfID)
 
 	p := tea.NewProgram(app, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	
+	// 捕获程序退出时的最终状态
+	m, err := p.Run()
+	if err != nil {
 		log.Fatal(err)
 	}
-}
 
+	// 程序退出时统一执行一次文件保存，彻底解决高 I/O 问题
+	if finalApp, ok := m.(tui.AppModel); ok {
+		finalApp.SaveHistory()
+	}
+}
