@@ -3,13 +3,7 @@
 TQQ 是一个使用 Go 语言和 [Bubble Tea](https://github.com/charmbracelet/bubbletea) 构建的、基于终端的轻量 QQ 客户端。它以 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 作为后端，支持远程部署，本地只需要运行 **30MB** 左右的 TUI 客户端。
 ## ✨ 主要特性
 
-* **终端 UI (TUI)**: 采用 Charm CLI 生态 (Bubble Tea, Lipgloss) 构建的美观、易用的交互界面。
-* **类 Vim 键位绑定**: 键盘操作流畅顺滑，支持 Normal 模式与 Insert 模式切换，列表导航等功能。
-* **丰富的图片支持**:
-  * 使用 `chafa` 在终端内预览图片（自动降级支持 Kitty 协议、Sixel 以及 ASCII 字符画）。
-  * 在 Wayland 环境下，支持直接粘贴剪贴板图片（基于 `wl-paste`）。
-  * 支持通过文件选择器选择并发送本地图片。
-* **本地历史记录**: 自动将聊天记录保存在本地 (`~/.config/tqq/history.json`)，下次启动时无缝恢复。
+图像支持、剪贴板/文件发送图片; 纯TUI，即使是 tty 也能运行。
 
 ## 🛠️ 环境要求与依赖
 
@@ -17,29 +11,17 @@ TQQ 是一个使用 Go 语言和 [Bubble Tea](https://github.com/charmbracelet/b
 
 * **Go**: 1.26.1 或更高版本
 * **NapCatQQ**: 需要作为后台 API 服务运行。
+
+(可选)
+
 * **chafa**: 用于在终端中渲染图片预览。
 * **wl-clipboard** (`wl-paste`): 用于在 Wayland 环境下发送剪贴板中的图片。
 * **zenity**: 用于弹出图形化文件选择框来选择发送图片。
 
-## 📦 编译与运行
 
-克隆本仓库，进入目录并进行编译运行：
-
-```bash
-# 下载依赖包
-go mod tidy
-
-# 编译
-go build -o tqq main.go
-
-# 运行
-./tqq
-```
 ## 🚀 快速开始
 
-如果你不是开发者，可以从 release 下载二进制包安装，或者直接用 `go install` 安装:
 ```bash
-# 确保系统安装了 Golang
 go install github.com/timetetng/tqq@latest
 
 # 运行
@@ -56,9 +38,9 @@ tqq
 ws_url = "ws://localhost:3001"
 # NapCatQQ 的 HTTP URL (用于获取图片等)
 http_url = "http://localhost:3000"
-# 访问令牌 Token (如果在 NapCat 中配置了鉴权)
+# 访问令牌 Token 
 token = "your_access_token_here"
-# 你自己的 QQ 号 (用于区分自己发送的消息，实现右侧对齐)
+# 你自己的 QQ 号
 self_id = 123456789
 
 [ui]
